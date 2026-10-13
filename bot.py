@@ -151,7 +151,7 @@ async def givecoins_error(ctx, error):
 import asyncio
 
 # Change this to match your Discord role name exactly.
-MODERATOR_ROLE = "MOD"
+MODERATOR_ROLE = "MODERATOR"
 
 active_raffle = None
 
