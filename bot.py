@@ -11,7 +11,7 @@ CHAT_COOLDOWN = 60
 STARTING_COINS = 100
 MODERATOR_ROLE = "Stream Mod"
 RAFFLE_SECONDS = 60
-# The #coins channel in your NEW Discord server
+# New Discord's #coins channel ID
 COINS_CHANNEL_ID = 1559575575239069737
 db = sqlite3.connect("streamcoins.db")
 db.execute("""
@@ -152,6 +152,9 @@ async def raffle(ctx, prize: int):
     await ctx.send(
         f"🎟️ **RAFFLE STARTED!**\n"
         f"Prize pool: 🪙 {prize:,} coins\n"
+        f"Two random bonus winners will each receive up to "
+        f"2,000 coins, with the remaining pool shared by "
+        f"other entrants.\n"
         f"Type `!join` within {RAFFLE_SECONDS} seconds to enter for free!"
     )
     await asyncio.sleep(RAFFLE_SECONDS)
@@ -167,15 +170,47 @@ async def raffle(ctx, prize: int):
             "🎟️ Raffle ended with no entrants. No coins awarded."
         )
         return
-    winners = random.sample(entrants, min(2, len(entrants)))
-    each_prize = prize // len(winners)
-    remainder = prize % len(winners)
-    results = []
-    for index, winner_id in enumerate(winners):
-        reward = each_prize + (1 if index < remainder else 0)
-        add_coins(winner_id, reward)
+    # With fewer than 3 entrants, share the full pool
+    # among those entrants to avoid an invalid payout.
+    if len(entrants) < 3:
+        each_prize = prize // len(entrants)
+        remainder = prize % len(entrants)
+        results = []
+        for index, winner_id in enumerate(entrants):
+            reward = each_prize + (1 if index < remainder else 0)
+            add_coins(winner_id, reward)
+            results.append(
+                f"🪙 <@{winner_id}> — {reward:,} coins"
+            )
+        await channel.send(
+            "🎉 **RAFFLE FINISHED!**\n"
+            "Not enough entrants for two bonus winners, "
+            "so the prize pool was shared equally.\n" +
+            "\n".join(results)
+        )
+        return
+    # Select two distinct random bonus winners
+    bonus_winners = random.sample(entrants, 2)
+    remaining_entrants = [
+        uid for uid in entrants if uid not in bonus_winners
+    ]
+    # Bonus is capped at 2,000 each and never exceeds the pool.
+    bonus_each = min(2000, prize // 2)
+    bonus_total = bonus_each * 2
+    remaining_pool = prize - bonus_total
+    # Split the rest among non-bonus entrants
+    each_share = remaining_pool // len(remaining_entrants)
+    remainder = remaining_pool % len(remaining_entrants)
+    results = [
+        f"🏆 <@{uid}> — 🪙 {bonus_each:,} bonus coins"
+        for uid in bonus_winners
+    ]
+    for index, uid in enumerate(remaining_entrants):
+        reward = each_share + (1 if index < remainder else 0)
+        if reward > 0:
+            add_coins(uid, reward)
         results.append(
-            f"🏆 <@{winner_id}> — 🪙 {reward:,} coins"
+            f"🪙 <@{uid}> — {reward:,} shared coins"
         )
     await channel.send(
         "🎉 **RAFFLE FINISHED!**\n" +
@@ -189,7 +224,7 @@ async def raffle_error(ctx, error):
             "can start a raffle."
         )
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("Usage: !raffle 10000")
+        await ctx.send("Usage: !raffle 5000")
     else:
         print(f"Raffle error: {repr(error)}")
         await ctx.send(
