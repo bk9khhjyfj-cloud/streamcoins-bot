@@ -11,8 +11,8 @@ CHAT_COOLDOWN = 60
 STARTING_COINS = 100
 MODERATOR_ROLE = "Stream Mod"
 RAFFLE_SECONDS = 60
-# Only allow commands in this channel
-COINS_CHANNEL_ID = 1559562293564547125
+# The #coins channel in your NEW Discord server
+COINS_CHANNEL_ID = 1559575575239069737
 db = sqlite3.connect("streamcoins.db")
 db.execute("""
 CREATE TABLE IF NOT EXISTS balances (
@@ -53,7 +53,7 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-    # Chat rewards work in every server channel
+    # Chat rewards work in every channel
     uid = message.author.id
     now = time.time()
     if now - last_reward.get(uid, 0) >= CHAT_COOLDOWN:
