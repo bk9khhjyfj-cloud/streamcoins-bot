@@ -11,6 +11,8 @@ CHAT_COOLDOWN = 60
 STARTING_COINS = 100
 MODERATOR_ROLE = "Stream Mod"
 RAFFLE_SECONDS = 60
+# Only allow commands in this channel
+COINS_CHANNEL_ID = 1559562293564547125
 db = sqlite3.connect("streamcoins.db")
 db.execute("""
 CREATE TABLE IF NOT EXISTS balances (
@@ -51,12 +53,24 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
+    # Chat rewards work in every server channel
     uid = message.author.id
     now = time.time()
     if now - last_reward.get(uid, 0) >= CHAT_COOLDOWN:
         add_coins(uid, CHAT_REWARD)
         last_reward[uid] = now
     await bot.process_commands(message)
+@bot.check
+async def commands_only_in_coins(ctx):
+    if ctx.guild is None:
+        return False
+    if ctx.channel.id != COINS_CHANNEL_ID:
+        if ctx.command:
+            await ctx.send(
+                f"🪙 Please use my commands in <#{COINS_CHANNEL_ID}>!"
+            )
+        return False
+    return True
 @bot.command(name="balance")
 async def show_balance(ctx):
     await ctx.send(
