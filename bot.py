@@ -29,7 +29,6 @@ RAFFLE_SECONDS = 60
 DAILY_BONUS = 1000
 WHEEL_COOLDOWN = 24 * 60 * 60
 
-# Virtual, cosmetic-only shop items.
 SHOP_ITEMS = {
     "gold_badge": {
         "name": "Golden Badge",
@@ -52,8 +51,7 @@ SHOP_ITEMS = {
 # DATABASE
 # ============================================================
 
-# IMPORTANT: keep using the existing streamcoins.db.
-# Never delete this file to update the bot.
+# Keep using the existing database to preserve balances.
 db = sqlite3.connect("streamcoins.db", timeout=30)
 db.execute("PRAGMA busy_timeout = 30000")
 db.execute("PRAGMA foreign_keys = ON")
@@ -65,7 +63,6 @@ CREATE TABLE IF NOT EXISTS balances (
 )
 """)
 
-# Existing raffle payout records are preserved.
 db.execute("""
 CREATE TABLE IF NOT EXISTS raffle_payouts (
     raffle_id TEXT PRIMARY KEY,
@@ -196,7 +193,6 @@ def balance(user_id):
 
 
 def add_coins(user_id, amount, action="adjustment", details=""):
-    # Ensure existing users retain their existing balances.
     balance(user_id)
 
     with db:
@@ -206,13 +202,11 @@ def add_coins(user_id, amount, action="adjustment", details=""):
         )
         log_audit(user_id, amount, action, details)
 
-        # Positive rewards count towards weekly champions.
         if amount > 0:
             record_weekly_earning(user_id, amount)
 
 
 def level_from_xp(xp):
-    # 100 XP for level 1, 400 XP for level 2, etc.
     return int(math.sqrt(max(0, xp) / 100))
 
 
@@ -248,7 +242,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
     db.execute("BEGIN IMMEDIATE")
 
     try:
-        # Unique ID prevents paying the same raffle twice.
+        # Prevent the same raffle from being paid twice.
         db.execute(
             """
             INSERT INTO raffle_payouts (raffle_id, prize, payouts)
@@ -318,7 +312,6 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
         db.rollback()
         raise
 
-    # Read saved balances again after commit.
     for user_id, amount in payouts.items():
         saved = db.execute(
             "SELECT coins FROM balances WHERE user_id = ?",
@@ -367,7 +360,7 @@ async def on_ready():
     print(f"Database: {os.path.abspath('streamcoins.db')}")
     print(f"Commands channel: {COINS_CHANNEL_ID}")
 
-    # Resume a saved raffle after a bot restart.
+    # Recover an active raffle after a restart.
     if active_raffle is None:
         row = db.execute(
             """
@@ -381,6 +374,7 @@ async def on_ready():
 
         if row:
             raffle_id, guild_id, channel_id, prize, end_time = row
+
             active_raffle = {
                 "id": raffle_id,
                 "guild_id": guild_id,
@@ -423,7 +417,6 @@ async def on_message(message):
     user_id = message.author.id
     now = time.time()
 
-    # Coin reward: once every 60 seconds per user.
     if now - last_chat_reward.get(user_id, 0) >= CHAT_COOLDOWN:
         try:
             add_coins(
@@ -436,7 +429,6 @@ async def on_message(message):
         except sqlite3.Error as error:
             print(f"CHAT REWARD ERROR: {error!r}")
 
-    # XP reward also has a cooldown to discourage spam farming.
     if now - last_chat_xp.get(user_id, 0) >= CHAT_COOLDOWN:
         try:
             add_xp(user_id, CHAT_XP)
@@ -517,7 +509,6 @@ async def slots(ctx, amount: int):
             await ctx.send(f"You only have {coins:,} coins.")
             return
 
-        # Weighted outcomes: jackpot, triple, pair, or miss.
         outcome = random.choices(
             ["jackpot", "triple", "pair", "miss"],
             weights=[1, 5, 24, 70],
@@ -537,7 +528,6 @@ async def slots(ctx, amount: int):
             payout = 0
             symbols = "🍋 🍊 🍒"
 
-        # Net balance change: subtract stake, then credit any winnings.
         net = payout - amount
 
         add_coins(
@@ -590,8 +580,8 @@ async def daily(ctx):
         return
 
     db.execute("BEGIN IMMEDIATE")
+
     try:
-        # Recheck within the transaction to prevent duplicate claims.
         row = db.execute(
             "SELECT claimed_at FROM daily_claims WHERE user_id = ?",
             (user_id,)
@@ -672,8 +662,8 @@ async def spin(ctx):
     )[0]
 
     db.execute("BEGIN IMMEDIATE")
+
     try:
-        # Recheck the cooldown within the transaction.
         row = db.execute(
             "SELECT claimed_at FROM wheel_claims WHERE user_id = ?",
             (user_id,)
@@ -767,6 +757,35 @@ async def level(ctx, member: discord.Member = None):
 # LEADERBOARD
 # ============================================================
 
+async def get_player_name(guild, user_id):
+    """Get a server display name, falling back to the Discord username."""
+    member = guild.get_member(user_id) if guild else None
+
+    if member is not None:
+        return member.display_name
+
+    if guild is not None:
+        try:
+            member = await guild.fetch_member(user_id)
+            return member.display_name
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+            pass
+
+    try:
+        user = await bot.fetch_user(user_id)
+        return user.name
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+        return f"Unknown player ({user_id})"
+
+
 @bot.command()
 async def leaderboard(ctx):
     rows = db.execute(
@@ -779,35 +798,12 @@ async def leaderboard(ctx):
     lines = []
 
     for rank, (user_id, coins) in enumerate(rows, start=1):
-        member = ctx.guild.get_member(user_id)
-
-        if member is None:
-            try:
-                member = await ctx.guild.fetch_member(user_id)
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                member = None
-
-        if member:
-            name = member.display_name
-        else:
-            try:
-                user = await bot.fetch_user(user_id)
-                name = user.name
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                name = f"Unknown player ({user_id})"
+        name = await get_player_name(ctx.guild, user_id)
+        name = discord.utils.escape_markdown(name)
 
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"**{rank}.**")
         lines.append(
-            f"{medal} **{discord.utils.escape_markdown(name)}** "
-            f"— 🪙 {coins:,}"
+            f"{medal} **{name}** — 🪙 {coins:,}"
         )
 
     await ctx.send(
@@ -838,20 +834,8 @@ async def weekly(ctx):
     lines = []
 
     for rank, (user_id, coins) in enumerate(rows, start=1):
-        member = ctx.guild.get_member(user_id)
-
-        if member:
-            name = member.display_name
-        else:
-            try:
-                user = await bot.fetch_user(user_id)
-                name = user.name
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                name = f"Unknown player ({user_id})"
+        name = await get_player_name(ctx.guild, user_id)
+        name = discord.utils.escape_markdown(name)
 
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"**{rank}.**")
         lines.append(f"{medal} **{name}** — 🪙 {coins:,} earned")
@@ -894,6 +878,7 @@ async def buy(ctx, item_id: str):
     price = item["price"]
 
     db.execute("BEGIN IMMEDIATE")
+
     try:
         db.execute(
             """
@@ -994,6 +979,7 @@ async def pay(ctx, member: discord.Member, amount: int):
         return
 
     db.execute("BEGIN IMMEDIATE")
+
     try:
         db.execute(
             """
@@ -1082,7 +1068,7 @@ async def givecoins_error(ctx, error):
 
 
 # ============================================================
-# AUDIT LOG
+# AUDIT LOG — DISPLAY PLAYER NAMES
 # ============================================================
 
 @bot.command()
@@ -1092,8 +1078,10 @@ async def audit(ctx, member: discord.Member = None):
         rows = db.execute(
             """
             SELECT user_id, amount, action, details, created_at
-            FROM audit_log WHERE user_id = ?
-            ORDER BY id DESC LIMIT 10
+            FROM audit_log
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 10
             """,
             (member.id,)
         ).fetchall()
@@ -1101,7 +1089,9 @@ async def audit(ctx, member: discord.Member = None):
         rows = db.execute(
             """
             SELECT user_id, amount, action, details, created_at
-            FROM audit_log ORDER BY id DESC LIMIT 10
+            FROM audit_log
+            ORDER BY id DESC
+            LIMIT 10
             """
         ).fetchall()
 
@@ -1112,13 +1102,48 @@ async def audit(ctx, member: discord.Member = None):
     lines = ["🛡️ **Recent coin activity**"]
 
     for user_id, amount, action, details, created_at in rows:
+        # First try to get the member's server display name.
+        player = ctx.guild.get_member(user_id)
+
+        if player is None:
+            try:
+                player = await ctx.guild.fetch_member(user_id)
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                player = None
+
+        if player is not None:
+            name = player.display_name
+        else:
+            # If they aren't in the server, try their Discord username.
+            try:
+                user = await bot.fetch_user(user_id)
+                name = user.name
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                name = f"Unknown player ({user_id})"
+
+        name = discord.utils.escape_markdown(name)
+        details = discord.utils.escape_markdown(details[:60])
+
         lines.append(
-            f"User `{user_id}` | {amount:+,} | `{action}` "
-            f"| {details[:60]} | {created_at}"
+            f"**{name}** | {amount:+,} coins | `{action}` "
+            f"| {details} | {created_at}"
         )
 
-    # Discord messages have a character limit.
-    await ctx.send("\n".join(lines)[:1900])
+    # Keep the message within Discord's message-length limit.
+    output = "\n".join(lines)
+
+    if len(output) > 1900:
+        output = output[:1890] + "\n…"
+
+    await ctx.send(output)
 
 
 # ============================================================
@@ -1168,7 +1193,11 @@ async def finish_raffle(raffle_id):
     if channel is None:
         try:
             channel = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException
+        ):
             print(f"RAFFLE CHANNEL UNAVAILABLE: {channel_id}")
             return
 
@@ -1311,6 +1340,10 @@ async def join(ctx):
 
     if active_raffle["channel_id"] != ctx.channel.id:
         await ctx.send("This raffle is running in a different channel.")
+        return
+
+    if time.time() >= active_raffle["end_time"]:
+        await ctx.send("This raffle has ended. Please wait for the results.")
         return
 
     try:
