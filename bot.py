@@ -51,7 +51,8 @@ SHOP_ITEMS = {
 # DATABASE
 # ============================================================
 
-# Keep using the existing database to preserve balances.
+# Keep using the existing database to preserve all balances
+# and audit history. Do not delete streamcoins.db.
 db = sqlite3.connect("streamcoins.db", timeout=30)
 db.execute("PRAGMA busy_timeout = 30000")
 db.execute("PRAGMA foreign_keys = ON")
@@ -754,11 +755,11 @@ async def level(ctx, member: discord.Member = None):
 
 
 # ============================================================
-# LEADERBOARD
+# PLAYER NAME LOOKUP
 # ============================================================
 
 async def get_player_name(guild, user_id):
-    """Get a server display name, falling back to the Discord username."""
+    """Get a server display name, falling back to a Discord username."""
     member = guild.get_member(user_id) if guild else None
 
     if member is not None:
@@ -786,6 +787,35 @@ async def get_player_name(guild, user_id):
         return f"Unknown player ({user_id})"
 
 
+async def resolve_audit_details(guild, details):
+    """
+    Convert older audit details containing Discord IDs into names.
+    Examples:
+      From 304751934240325643 -> From StreamMod
+      To 304751934240325643 -> To MADPOPROC2016
+      Granted by 304751934240325643 -> Granted by StreamMod
+    """
+    if not details:
+        return details
+
+    prefixes = ("From ", "To ", "Granted by ")
+
+    for prefix in prefixes:
+        if details.startswith(prefix):
+            possible_id = details[len(prefix):].strip()
+
+            # Only attempt a lookup when the entire value is a numeric ID.
+            if possible_id.isdigit():
+                name = await get_player_name(guild, int(possible_id))
+                return f"{prefix}{name}"
+
+    return details
+
+
+# ============================================================
+# LEADERBOARD
+# ============================================================
+
 @bot.command()
 async def leaderboard(ctx):
     rows = db.execute(
@@ -802,9 +832,7 @@ async def leaderboard(ctx):
         name = discord.utils.escape_markdown(name)
 
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"**{rank}.**")
-        lines.append(
-            f"{medal} **{name}** — 🪙 {coins:,}"
-        )
+        lines.append(f"{medal} **{name}** — 🪙 {coins:,}")
 
     await ctx.send(
         "🏆 **StreamCoins Leaderboard**\n" +
@@ -978,6 +1006,10 @@ async def pay(ctx, member: discord.Member, amount: int):
         await ctx.send("Enter a positive amount, e.g. `!pay @member 500`.")
         return
 
+    # Save names in new audit entries instead of numeric user IDs.
+    sender_name = ctx.author.display_name
+    receiver_name = member.display_name
+
     db.execute("BEGIN IMMEDIATE")
 
     try:
@@ -1003,9 +1035,7 @@ async def pay(ctx, member: discord.Member, amount: int):
 
         if sender_balance < amount:
             db.rollback()
-            await ctx.send(
-                f"You only have {sender_balance:,} coins."
-            )
+            await ctx.send(f"You only have {sender_balance:,} coins.")
             return
 
         db.execute(
@@ -1017,8 +1047,20 @@ async def pay(ctx, member: discord.Member, amount: int):
             (amount, receiver_id)
         )
 
-        log_audit(sender_id, -amount, "transfer_sent", f"To {receiver_id}")
-        log_audit(receiver_id, amount, "transfer_received", f"From {sender_id}")
+        # New records now contain names, not numeric IDs.
+        log_audit(
+            sender_id,
+            -amount,
+            "transfer_sent",
+            f"To {receiver_name}"
+        )
+        log_audit(
+            receiver_id,
+            amount,
+            "transfer_received",
+            f"From {sender_name}"
+        )
+
         db.commit()
 
     except Exception as error:
@@ -1045,15 +1087,20 @@ async def givecoins(ctx, member: discord.Member, amount: int):
         return
 
     try:
+        # Save the moderator's display name in the audit details.
+        moderator_name = ctx.author.display_name
+
         add_coins(
             member.id,
             amount,
             "admin_grant",
-            f"Granted by {ctx.author.id}"
+            f"Granted by {moderator_name}"
         )
+
         await ctx.send(
             f"🪙 Gave {amount:,} coins to {member.mention}."
         )
+
     except sqlite3.Error as error:
         print(f"GIVECOINS ERROR: {error!r}")
         await ctx.send("Couldn't save those coins. Please try again.")
@@ -1068,7 +1115,7 @@ async def givecoins_error(ctx, error):
 
 
 # ============================================================
-# AUDIT LOG — DISPLAY PLAYER NAMES
+# AUDIT LOG — DISPLAY PLAYER NAMES AND RESOLVE OLD IDS
 # ============================================================
 
 @bot.command()
@@ -1102,38 +1149,21 @@ async def audit(ctx, member: discord.Member = None):
     lines = ["🛡️ **Recent coin activity**"]
 
     for user_id, amount, action, details, created_at in rows:
-        # First try to get the member's server display name.
-        player = ctx.guild.get_member(user_id)
-
-        if player is None:
-            try:
-                player = await ctx.guild.fetch_member(user_id)
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                player = None
-
-        if player is not None:
-            name = player.display_name
-        else:
-            # If they aren't in the server, try their Discord username.
-            try:
-                user = await bot.fetch_user(user_id)
-                name = user.name
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                name = f"Unknown player ({user_id})"
-
+        # Resolve the player whose balance was affected.
+        name = await get_player_name(ctx.guild, user_id)
         name = discord.utils.escape_markdown(name)
-        details = discord.utils.escape_markdown(details[:60])
+
+        # Convert old "From <ID>", "To <ID>", and
+        # "Granted by <ID>" audit details into names.
+        details = await resolve_audit_details(ctx.guild, details)
+
+        # Escape names/details so Markdown characters in display names
+        # cannot accidentally break the audit formatting.
+        details = discord.utils.escape_markdown(details[:100])
+        safe_action = discord.utils.escape_markdown(action)
 
         lines.append(
-            f"**{name}** | {amount:+,} coins | `{action}` "
+            f"**{name}** | {amount:+,} coins | `{safe_action}` "
             f"| {details} | {created_at}"
         )
 
@@ -1144,6 +1174,14 @@ async def audit(ctx, member: discord.Member = None):
         output = output[:1890] + "\n…"
 
     await ctx.send(output)
+
+
+@audit.error
+async def audit_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need Manage Server permission to use `!audit`.")
+    else:
+        await ctx.send("Usage: `!audit` or `!audit @member`")
 
 
 # ============================================================
@@ -1212,6 +1250,7 @@ async def finish_raffle(raffle_id):
             )
 
         active_raffle = None
+        raffle_task = None
         await channel.send(
             "🎟️ Raffle ended with no entrants. No coins awarded."
         )
