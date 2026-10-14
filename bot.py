@@ -1,29 +1,62 @@
 
 import os
+import json
+import math
 import random
+import sqlite3
 import time
 import uuid
-import json
-import sqlite3
 import asyncio
+from datetime import datetime, timezone
+
 import discord
 from discord.ext import commands
 
-# ---------------- CONFIGURATION ----------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+COINS_CHANNEL_ID = 1559575575239069737
+MODERATOR_ROLE = "Stream Mod"
+
+STARTING_COINS = 100
 CHAT_REWARD = 5
 CHAT_COOLDOWN = 60
-STARTING_COINS = 100
-
-MODERATOR_ROLE = "Stream Mod"
+CHAT_XP = 5
 RAFFLE_SECONDS = 60
-COINS_CHANNEL_ID = 1559575575239069737
+DAILY_BONUS = 1000
+WHEEL_COOLDOWN = 24 * 60 * 60
 
-# Keep the existing database. Do not delete or reset it.
+# Virtual, cosmetic-only shop items.
+SHOP_ITEMS = {
+    "gold_badge": {
+        "name": "Golden Badge",
+        "price": 5000,
+        "description": "A collectible virtual badge."
+    },
+    "lucky_charm": {
+        "name": "Lucky Charm",
+        "price": 7500,
+        "description": "A collectible virtual lucky charm."
+    },
+    "trophy": {
+        "name": "Champion Trophy",
+        "price": 15000,
+        "description": "A collectible virtual trophy."
+    },
+}
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+# IMPORTANT: keep using the existing streamcoins.db.
+# Never delete this file to update the bot.
 db = sqlite3.connect("streamcoins.db", timeout=30)
 db.execute("PRAGMA busy_timeout = 30000")
+db.execute("PRAGMA foreign_keys = ON")
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS balances (
@@ -32,7 +65,7 @@ CREATE TABLE IF NOT EXISTS balances (
 )
 """)
 
-# Records completed raffle payouts to prevent duplicate payout IDs.
+# Existing raffle payout records are preserved.
 db.execute("""
 CREATE TABLE IF NOT EXISTS raffle_payouts (
     raffle_id TEXT PRIMARY KEY,
@@ -41,20 +74,109 @@ CREATE TABLE IF NOT EXISTS raffle_payouts (
     completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """)
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS active_raffles (
+    raffle_id TEXT PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    prize INTEGER NOT NULL,
+    end_time REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS raffle_entries (
+    raffle_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (raffle_id, user_id)
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS daily_claims (
+    user_id INTEGER PRIMARY KEY,
+    claimed_at REAL NOT NULL
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS wheel_claims (
+    user_id INTEGER PRIMARY KEY,
+    claimed_at REAL NOT NULL
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS player_xp (
+    user_id INTEGER PRIMARY KEY,
+    xp INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS inventory (
+    user_id INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, item_id)
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS weekly_earnings (
+    week_start TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    coins INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (week_start, user_id)
+)
+""")
+
 db.commit()
 
-# ---------------- DISCORD SETUP ----------------
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-last_reward = {}
-active_raffle = None
+def current_week():
+    now = datetime.now(timezone.utc).date()
+    monday = now.fromordinal(now.toordinal() - now.weekday())
+    return monday.isoformat()
 
 
-# ---------------- BALANCE FUNCTIONS ----------------
+def log_audit(user_id, amount, action, details=""):
+    db.execute(
+        """
+        INSERT INTO audit_log (user_id, amount, action, details)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, amount, action, details)
+    )
+
+
+def record_weekly_earning(user_id, amount):
+    if amount <= 0:
+        return
+
+    db.execute(
+        """
+        INSERT INTO weekly_earnings (week_start, user_id, coins)
+        VALUES (?, ?, ?)
+        ON CONFLICT(week_start, user_id)
+        DO UPDATE SET coins = coins + excluded.coins
+        """,
+        (current_week(), user_id, amount)
+    )
+
 
 def balance(user_id):
     row = db.execute(
@@ -73,24 +195,49 @@ def balance(user_id):
     return row[0]
 
 
-def add_coins(user_id, amount):
+def add_coins(user_id, amount, action="adjustment", details=""):
+    # Ensure existing users retain their existing balances.
     balance(user_id)
-    db.execute(
-        "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
-        (amount, user_id)
-    )
-    db.commit()
+
+    with db:
+        db.execute(
+            "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        log_audit(user_id, amount, action, details)
+
+        # Positive rewards count towards weekly champions.
+        if amount > 0:
+            record_weekly_earning(user_id, amount)
 
 
-# ---------------- SAFE RAFFLE PAYOUT ----------------
+def level_from_xp(xp):
+    # 100 XP for level 1, 400 XP for level 2, etc.
+    return int(math.sqrt(max(0, xp) / 100))
+
+
+def add_xp(user_id, amount):
+    with db:
+        db.execute(
+            """
+            INSERT INTO player_xp (user_id, xp)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET xp = xp + excluded.xp
+            """,
+            (user_id, amount)
+        )
+
+
+# ============================================================
+# ATOMIC RAFFLE PAYOUT
+# ============================================================
 
 def pay_raffle_atomically(raffle_id, prize, payouts):
-    """Apply every payout in one database transaction."""
-
-    total = sum(payouts.values())
-    if total != prize:
+    if sum(payouts.values()) != prize:
         raise ValueError(
-            f"Payout total {total} does not equal prize {prize}"
+            f"Payout total {sum(payouts.values())} "
+            f"does not equal prize {prize}"
         )
 
     payout_json = json.dumps({
@@ -101,7 +248,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
     db.execute("BEGIN IMMEDIATE")
 
     try:
-        # The unique raffle ID prevents this raffle being paid twice.
+        # Unique ID prevents paying the same raffle twice.
         db.execute(
             """
             INSERT INTO raffle_payouts (raffle_id, prize, payouts)
@@ -126,8 +273,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
 
             db.execute(
                 """
-                UPDATE balances
-                SET coins = coins + ?
+                UPDATE balances SET coins = coins + ?
                 WHERE user_id = ?
                 """,
                 (amount, user_id)
@@ -140,8 +286,16 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
 
             if after != before + amount:
                 raise RuntimeError(
-                    f"Balance verification failed for user {user_id}"
+                    f"Balance verification failed for {user_id}"
                 )
+
+            log_audit(
+                user_id,
+                amount,
+                "raffle_payout",
+                f"Raffle {raffle_id}"
+            )
+            record_weekly_earning(user_id, amount)
 
             print(
                 f"RAFFLE PAYOUT CHECK | raffle={raffle_id} "
@@ -149,13 +303,22 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
                 f"| added={amount} | after={after}"
             )
 
+        db.execute(
+            """
+            UPDATE active_raffles
+            SET status = 'completed'
+            WHERE raffle_id = ?
+            """,
+            (raffle_id,)
+        )
+
         db.commit()
 
     except Exception:
         db.rollback()
         raise
 
-    # Read balances again after commit for console verification.
+    # Read saved balances again after commit.
     for user_id, amount in payouts.items():
         saved = db.execute(
             "SELECT coins FROM balances WHERE user_id = ?",
@@ -164,7 +327,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
 
         if saved is None:
             raise RuntimeError(
-                f"Missing balance after commit for user {user_id}"
+                f"Missing balance after commit for {user_id}"
             )
 
         print(
@@ -175,11 +338,64 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
 
     print(
         f"RAFFLE COMPLETE | raffle={raffle_id} "
-        f"| total_paid={total}"
+        f"| total_paid={sum(payouts.values())}"
     )
 
 
-# ---------------- CHANNEL RESTRICTION ----------------
+# ============================================================
+# DISCORD SETUP
+# ============================================================
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+last_chat_reward = {}
+last_chat_xp = {}
+
+active_raffle = None
+raffle_task = None
+
+
+@bot.event
+async def on_ready():
+    global active_raffle, raffle_task
+
+    print(f"StreamCoins online as {bot.user}")
+    print(f"Database: {os.path.abspath('streamcoins.db')}")
+    print(f"Commands channel: {COINS_CHANNEL_ID}")
+
+    # Resume a saved raffle after a bot restart.
+    if active_raffle is None:
+        row = db.execute(
+            """
+            SELECT raffle_id, guild_id, channel_id, prize, end_time
+            FROM active_raffles
+            WHERE status = 'active'
+            ORDER BY end_time ASC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if row:
+            raffle_id, guild_id, channel_id, prize, end_time = row
+            active_raffle = {
+                "id": raffle_id,
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "prize": prize,
+                "end_time": end_time,
+            }
+
+            if raffle_task is None or raffle_task.done():
+                raffle_task = asyncio.create_task(
+                    finish_raffle(raffle_id)
+                )
+
+            print(f"Recovered active raffle {raffle_id}")
+
 
 @bot.check
 async def commands_only_in_coins(ctx):
@@ -195,7 +411,9 @@ async def commands_only_in_coins(ctx):
     return True
 
 
-# ---------------- CHAT REWARDS ----------------
+# ============================================================
+# CHAT REWARDS AND XP
+# ============================================================
 
 @bot.event
 async def on_message(message):
@@ -205,42 +423,49 @@ async def on_message(message):
     user_id = message.author.id
     now = time.time()
 
-    if now - last_reward.get(user_id, 0) >= CHAT_COOLDOWN:
+    # Coin reward: once every 60 seconds per user.
+    if now - last_chat_reward.get(user_id, 0) >= CHAT_COOLDOWN:
         try:
-            add_coins(user_id, CHAT_REWARD)
-            last_reward[user_id] = now
+            add_coins(
+                user_id,
+                CHAT_REWARD,
+                "chat_reward",
+                "Chat activity reward"
+            )
+            last_chat_reward[user_id] = now
         except sqlite3.Error as error:
-            print(f"CHAT REWARD DATABASE ERROR: {error!r}")
+            print(f"CHAT REWARD ERROR: {error!r}")
+
+    # XP reward also has a cooldown to discourage spam farming.
+    if now - last_chat_xp.get(user_id, 0) >= CHAT_COOLDOWN:
+        try:
+            add_xp(user_id, CHAT_XP)
+            last_chat_xp[user_id] = now
+        except sqlite3.Error as error:
+            print(f"CHAT XP ERROR: {error!r}")
 
     await bot.process_commands(message)
 
 
-# ---------------- STARTUP ----------------
-
-@bot.event
-async def on_ready():
-    print(f"StreamCoins online as {bot.user}")
-    print(f"Database: {os.path.abspath('streamcoins.db')}")
-    print(f"Commands channel ID: {COINS_CHANNEL_ID}")
-
-
-# ---------------- BALANCE ----------------
+# ============================================================
+# BALANCE
+# ============================================================
 
 @bot.command(name="balance")
 async def show_balance(ctx):
     try:
         coins = balance(ctx.author.id)
         await ctx.send(
-            f"🪙 {ctx.author.display_name}: {coins:,} coins"
+            f"🪙 {ctx.author.display_name}: **{coins:,} coins**"
         )
     except sqlite3.Error as error:
-        print(f"BALANCE DATABASE ERROR: {error!r}")
-        await ctx.send(
-            "Couldn't read your balance just now. Please try again."
-        )
+        print(f"BALANCE ERROR: {error!r}")
+        await ctx.send("Couldn't read your balance. Please try again.")
 
 
-# ---------------- GAMBLE ----------------
+# ============================================================
+# STANDARD GAMBLE
+# ============================================================
 
 @bot.command()
 async def gamble(ctx, amount: int):
@@ -258,86 +483,573 @@ async def gamble(ctx, amount: int):
             return
 
         if random.random() < 0.45:
-            add_coins(user_id, amount)
+            add_coins(user_id, amount, "gamble_win", "Won a gamble")
             result = f"won {amount:,} coins!"
         else:
-            add_coins(user_id, -amount)
+            add_coins(user_id, -amount, "gamble_loss", "Lost a gamble")
             result = f"lost {amount:,} coins."
 
         await ctx.send(
-            f"🎰 {ctx.author.mention} {result} "
+            f"🎲 {ctx.author.mention} {result} "
             f"Balance: {balance(user_id):,} coins."
         )
-
     except sqlite3.Error as error:
-        print(f"GAMBLE DATABASE ERROR: {error!r}")
+        print(f"GAMBLE ERROR: {error!r}")
         await ctx.send("Couldn't save that gamble. Please try again.")
 
 
-# ---------------- LEADERBOARD ----------------
+# ============================================================
+# JACKPOT SLOTS
+# ============================================================
+
+@bot.command()
+async def slots(ctx, amount: int):
+    user_id = ctx.author.id
+
+    if amount <= 0:
+        await ctx.send("Enter a positive stake, e.g. `!slots 500`.")
+        return
+
+    try:
+        coins = balance(user_id)
+
+        if amount > coins:
+            await ctx.send(f"You only have {coins:,} coins.")
+            return
+
+        # Weighted outcomes: jackpot, triple, pair, or miss.
+        outcome = random.choices(
+            ["jackpot", "triple", "pair", "miss"],
+            weights=[1, 5, 24, 70],
+            k=1
+        )[0]
+
+        if outcome == "jackpot":
+            payout = amount * 10
+            symbols = "💎 💎 💎"
+        elif outcome == "triple":
+            payout = amount * 5
+            symbols = "7️⃣ 7️⃣ 7️⃣"
+        elif outcome == "pair":
+            payout = (amount * 3) // 2
+            symbols = "🍒 🍒 🍋"
+        else:
+            payout = 0
+            symbols = "🍋 🍊 🍒"
+
+        # Net balance change: subtract stake, then credit any winnings.
+        net = payout - amount
+
+        add_coins(
+            user_id,
+            net,
+            "slots",
+            f"Symbols {symbols}; stake {amount}; payout {payout}"
+        )
+
+        if payout > amount:
+            result = f"You won **{payout:,} coins**!"
+        elif payout == amount:
+            result = "You got your stake back!"
+        else:
+            result = f"You lost **{amount:,} coins**."
+
+        await ctx.send(
+            f"🎰 **{symbols}**\n{ctx.author.mention}, {result}\n"
+            f"Balance: 🪙 {balance(user_id):,}"
+        )
+
+    except sqlite3.Error as error:
+        print(f"SLOTS ERROR: {error!r}")
+        await ctx.send("Couldn't save the slot result. Please try again.")
+
+
+# ============================================================
+# DAILY BONUS
+# ============================================================
+
+@bot.command()
+async def daily(ctx):
+    user_id = ctx.author.id
+    now = time.time()
+
+    row = db.execute(
+        "SELECT claimed_at FROM daily_claims WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    if row and now - row[0] < 86400:
+        remaining = int(86400 - (now - row[0]))
+        hours, remainder = divmod(remaining, 3600)
+        minutes = remainder // 60
+
+        await ctx.send(
+            f"🎁 You've already claimed your daily bonus! "
+            f"Come back in {hours}h {minutes}m."
+        )
+        return
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        # Recheck within the transaction to prevent duplicate claims.
+        row = db.execute(
+            "SELECT claimed_at FROM daily_claims WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+        if row and now - row[0] < 86400:
+            db.rollback()
+            await ctx.send("You've already claimed your daily bonus.")
+            return
+
+        db.execute(
+            """
+            INSERT INTO daily_claims (user_id, claimed_at)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET claimed_at = excluded.claimed_at
+            """,
+            (user_id, now)
+        )
+
+        db.execute(
+            """
+            INSERT OR IGNORE INTO balances (user_id, coins)
+            VALUES (?, ?)
+            """,
+            (user_id, STARTING_COINS)
+        )
+
+        db.execute(
+            "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
+            (DAILY_BONUS, user_id)
+        )
+
+        log_audit(user_id, DAILY_BONUS, "daily_bonus")
+        record_weekly_earning(user_id, DAILY_BONUS)
+        db.commit()
+
+    except Exception as error:
+        db.rollback()
+        print(f"DAILY BONUS ERROR: {error!r}")
+        await ctx.send("Couldn't save your daily bonus. Please try again.")
+        return
+
+    await ctx.send(
+        f"🎁 {ctx.author.mention} claimed **{DAILY_BONUS:,} coins**!\n"
+        f"Balance: 🪙 {balance(user_id):,}"
+    )
+
+
+# ============================================================
+# LUCKY WHEEL
+# ============================================================
+
+@bot.command()
+async def spin(ctx):
+    user_id = ctx.author.id
+    now = time.time()
+
+    row = db.execute(
+        "SELECT claimed_at FROM wheel_claims WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    if row and now - row[0] < WHEEL_COOLDOWN:
+        remaining = int(WHEEL_COOLDOWN - (now - row[0]))
+        hours, remainder = divmod(remaining, 3600)
+        minutes = remainder // 60
+
+        await ctx.send(
+            f"🎡 Your wheel is recharging! Try again in {hours}h {minutes}m."
+        )
+        return
+
+    prize = random.choices(
+        [100, 250, 500, 1000, 2000, 5000],
+        weights=[30, 25, 20, 15, 8, 2],
+        k=1
+    )[0]
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        # Recheck the cooldown within the transaction.
+        row = db.execute(
+            "SELECT claimed_at FROM wheel_claims WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+        if row and now - row[0] < WHEEL_COOLDOWN:
+            db.rollback()
+            await ctx.send("Your wheel is still recharging.")
+            return
+
+        db.execute(
+            """
+            INSERT INTO wheel_claims (user_id, claimed_at)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET claimed_at = excluded.claimed_at
+            """,
+            (user_id, now)
+        )
+
+        db.execute(
+            """
+            INSERT OR IGNORE INTO balances (user_id, coins)
+            VALUES (?, ?)
+            """,
+            (user_id, STARTING_COINS)
+        )
+
+        db.execute(
+            "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
+            (prize, user_id)
+        )
+
+        log_audit(user_id, prize, "lucky_wheel")
+        record_weekly_earning(user_id, prize)
+        db.commit()
+
+    except Exception as error:
+        db.rollback()
+        print(f"WHEEL ERROR: {error!r}")
+        await ctx.send("Couldn't save your spin. Please try again.")
+        return
+
+    await ctx.send(
+        f"🎡 **The wheel landed on {prize:,}!**\n"
+        f"{ctx.author.mention} won 🪙 **{prize:,} coins**!\n"
+        f"Balance: {balance(user_id):,}"
+    )
+
+
+# ============================================================
+# LEVELS AND VIP RANKS
+# ============================================================
+
+def vip_rank(level):
+    if level >= 25:
+        return "💎 Diamond VIP"
+    if level >= 15:
+        return "👑 Gold VIP"
+    if level >= 8:
+        return "🥈 Silver VIP"
+    if level >= 3:
+        return "🥉 Bronze VIP"
+    return "🌱 Newcomer"
+
+
+@bot.command()
+async def level(ctx, member: discord.Member = None):
+    member = member or ctx.author
+
+    row = db.execute(
+        "SELECT xp FROM player_xp WHERE user_id = ?",
+        (member.id,)
+    ).fetchone()
+
+    xp = row[0] if row else 0
+    current_level = level_from_xp(xp)
+    next_level_xp = (current_level + 1) ** 2 * 100
+    remaining = max(0, next_level_xp - xp)
+
+    await ctx.send(
+        f"👑 **{member.display_name}'s profile**\n"
+        f"Rank: {vip_rank(current_level)}\n"
+        f"Level: **{current_level}**\n"
+        f"XP: **{xp:,}**\n"
+        f"XP to next level: **{remaining:,}**"
+    )
+
+
+# ============================================================
+# LEADERBOARD
+# ============================================================
 
 @bot.command()
 async def leaderboard(ctx):
+    rows = db.execute(
+        """
+        SELECT user_id, coins FROM balances
+        ORDER BY coins DESC LIMIT 10
+        """
+    ).fetchall()
+
+    lines = []
+
+    for rank, (user_id, coins) in enumerate(rows, start=1):
+        member = ctx.guild.get_member(user_id)
+
+        if member is None:
+            try:
+                member = await ctx.guild.fetch_member(user_id)
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                member = None
+
+        if member:
+            name = member.display_name
+        else:
+            try:
+                user = await bot.fetch_user(user_id)
+                name = user.name
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                name = f"Unknown player ({user_id})"
+
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"**{rank}.**")
+        lines.append(
+            f"{medal} **{discord.utils.escape_markdown(name)}** "
+            f"— 🪙 {coins:,}"
+        )
+
+    await ctx.send(
+        "🏆 **StreamCoins Leaderboard**\n" +
+        ("\n".join(lines) if lines else "No scores yet.")
+    )
+
+
+# ============================================================
+# WEEKLY CHAMPIONS
+# ============================================================
+
+@bot.command()
+async def weekly(ctx):
+    rows = db.execute(
+        """
+        SELECT user_id, coins FROM weekly_earnings
+        WHERE week_start = ?
+        ORDER BY coins DESC LIMIT 10
+        """,
+        (current_week(),)
+    ).fetchall()
+
+    if not rows:
+        await ctx.send("🏆 No weekly earnings recorded yet.")
+        return
+
+    lines = []
+
+    for rank, (user_id, coins) in enumerate(rows, start=1):
+        member = ctx.guild.get_member(user_id)
+
+        if member:
+            name = member.display_name
+        else:
+            try:
+                user = await bot.fetch_user(user_id)
+                name = user.name
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                name = f"Unknown player ({user_id})"
+
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"**{rank}.**")
+        lines.append(f"{medal} **{name}** — 🪙 {coins:,} earned")
+
+    await ctx.send(
+        f"🏆 **Weekly Champions** — week starting {current_week()}\n" +
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# COIN SHOP AND INVENTORY
+# ============================================================
+
+@bot.command()
+async def shop(ctx):
+    lines = ["🛍️ **StreamCoins Shop**"]
+
+    for item_id, item in SHOP_ITEMS.items():
+        lines.append(
+            f"`{item_id}` — **{item['name']}**: "
+            f"🪙 {item['price']:,}\n"
+            f"  {item['description']}"
+        )
+
+    lines.append("Buy an item with `!buy item_id`.")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command()
+async def buy(ctx, item_id: str):
+    item_id = item_id.lower()
+    item = SHOP_ITEMS.get(item_id)
+
+    if item is None:
+        await ctx.send("That item isn't in the shop. Use `!shop` to see items.")
+        return
+
+    user_id = ctx.author.id
+    price = item["price"]
+
+    db.execute("BEGIN IMMEDIATE")
     try:
-        rows = db.execute(
+        db.execute(
             """
-            SELECT user_id, coins
-            FROM balances
-            ORDER BY coins DESC
-            LIMIT 10
-            """
-        ).fetchall()
+            INSERT OR IGNORE INTO balances (user_id, coins)
+            VALUES (?, ?)
+            """,
+            (user_id, STARTING_COINS)
+        )
 
-        lines = []
+        coins = db.execute(
+            "SELECT coins FROM balances WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()[0]
 
-        for rank, (user_id, coins) in enumerate(rows, start=1):
-            member = ctx.guild.get_member(user_id)
-
-            # First try to fetch their current server membership.
-            if member is None:
-                try:
-                    member = await ctx.guild.fetch_member(user_id)
-                except (
-                    discord.NotFound,
-                    discord.Forbidden,
-                    discord.HTTPException
-                ):
-                    member = None
-
-            # If they are not in the server, try their global username.
-            if member is not None:
-                name = member.display_name
-            else:
-                try:
-                    user = await bot.fetch_user(user_id)
-                    name = user.name
-                except (
-                    discord.NotFound,
-                    discord.Forbidden,
-                    discord.HTTPException
-                ):
-                    name = f"Unknown player ({user_id})"
-
-            medal = {
-                1: "🥇",
-                2: "🥈",
-                3: "🥉"
-            }.get(rank, f"**{rank}.**")
-
-            lines.append(
-                f"{medal} **{discord.utils.escape_markdown(name)}** "
-                f"— 🪙 {coins:,} coins"
+        if coins < price:
+            db.rollback()
+            await ctx.send(
+                f"You need {price:,} coins, but you only have {coins:,}."
             )
+            return
 
-        text = "\n".join(lines) if lines else "No scores yet."
-        await ctx.send(f"🏆 **StreamCoins Leaderboard**\n{text}")
+        db.execute(
+            "UPDATE balances SET coins = coins - ? WHERE user_id = ?",
+            (price, user_id)
+        )
 
-    except sqlite3.Error as error:
-        print(f"LEADERBOARD DATABASE ERROR: {error!r}")
-        await ctx.send("Couldn't load the leaderboard just now.")
+        db.execute(
+            """
+            INSERT INTO inventory (user_id, item_id, quantity)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, item_id)
+            DO UPDATE SET quantity = quantity + 1
+            """,
+            (user_id, item_id)
+        )
+
+        log_audit(user_id, -price, "shop_purchase", item_id)
+        db.commit()
+
+    except Exception as error:
+        db.rollback()
+        print(f"SHOP ERROR: {error!r}")
+        await ctx.send("Purchase failed. Please try again.")
+        return
+
+    await ctx.send(
+        f"🛍️ {ctx.author.mention} purchased **{item['name']}**!\n"
+        f"Balance: 🪙 {balance(user_id):,}"
+    )
 
 
-# ---------------- GIVE COINS ----------------
+@bot.command()
+async def inventory(ctx, member: discord.Member = None):
+    member = member or ctx.author
+
+    rows = db.execute(
+        """
+        SELECT item_id, quantity FROM inventory
+        WHERE user_id = ? AND quantity > 0
+        ORDER BY item_id
+        """,
+        (member.id,)
+    ).fetchall()
+
+    if not rows:
+        await ctx.send(f"🎒 {member.display_name} has no shop items yet.")
+        return
+
+    lines = ["🎒 **Inventory**"]
+
+    for item_id, quantity in rows:
+        item = SHOP_ITEMS.get(item_id)
+        name = item["name"] if item else item_id
+        lines.append(f"• {name} × {quantity}")
+
+    await ctx.send("\n".join(lines))
+
+
+# ============================================================
+# PLAYER-TO-PLAYER TRANSFERS
+# ============================================================
+
+@bot.command()
+async def pay(ctx, member: discord.Member, amount: int):
+    sender_id = ctx.author.id
+    receiver_id = member.id
+
+    if receiver_id == sender_id:
+        await ctx.send("You can't send coins to yourself.")
+        return
+
+    if member.bot:
+        await ctx.send("You can't send coins to a bot.")
+        return
+
+    if amount <= 0:
+        await ctx.send("Enter a positive amount, e.g. `!pay @member 500`.")
+        return
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO balances (user_id, coins)
+            VALUES (?, ?)
+            """,
+            (sender_id, STARTING_COINS)
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO balances (user_id, coins)
+            VALUES (?, ?)
+            """,
+            (receiver_id, STARTING_COINS)
+        )
+
+        sender_balance = db.execute(
+            "SELECT coins FROM balances WHERE user_id = ?",
+            (sender_id,)
+        ).fetchone()[0]
+
+        if sender_balance < amount:
+            db.rollback()
+            await ctx.send(
+                f"You only have {sender_balance:,} coins."
+            )
+            return
+
+        db.execute(
+            "UPDATE balances SET coins = coins - ? WHERE user_id = ?",
+            (amount, sender_id)
+        )
+        db.execute(
+            "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
+            (amount, receiver_id)
+        )
+
+        log_audit(sender_id, -amount, "transfer_sent", f"To {receiver_id}")
+        log_audit(receiver_id, amount, "transfer_received", f"From {sender_id}")
+        db.commit()
+
+    except Exception as error:
+        db.rollback()
+        print(f"TRANSFER ERROR: {error!r}")
+        await ctx.send("Transfer failed. Please try again.")
+        return
+
+    await ctx.send(
+        f"💸 {ctx.author.mention} sent {member.mention} "
+        f"🪙 **{amount:,} coins**!"
+    )
+
+
+# ============================================================
+# ADMIN COIN GRANTS
+# ============================================================
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
@@ -347,12 +1059,17 @@ async def givecoins(ctx, member: discord.Member, amount: int):
         return
 
     try:
-        add_coins(member.id, amount)
+        add_coins(
+            member.id,
+            amount,
+            "admin_grant",
+            f"Granted by {ctx.author.id}"
+        )
         await ctx.send(
             f"🪙 Gave {amount:,} coins to {member.mention}."
         )
     except sqlite3.Error as error:
-        print(f"GIVECOINS DATABASE ERROR: {error!r}")
+        print(f"GIVECOINS ERROR: {error!r}")
         await ctx.send("Couldn't save those coins. Please try again.")
 
 
@@ -364,53 +1081,109 @@ async def givecoins_error(ctx, error):
         await ctx.send("Usage: `!givecoins @member 500`")
 
 
-# ---------------- START RAFFLE ----------------
+# ============================================================
+# AUDIT LOG
+# ============================================================
 
 @bot.command()
-@commands.has_role(MODERATOR_ROLE)
-async def raffle(ctx, prize: int):
-    global active_raffle
+@commands.has_permissions(manage_guild=True)
+async def audit(ctx, member: discord.Member = None):
+    if member:
+        rows = db.execute(
+            """
+            SELECT user_id, amount, action, details, created_at
+            FROM audit_log WHERE user_id = ?
+            ORDER BY id DESC LIMIT 10
+            """,
+            (member.id,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """
+            SELECT user_id, amount, action, details, created_at
+            FROM audit_log ORDER BY id DESC LIMIT 10
+            """
+        ).fetchall()
 
-    if active_raffle is not None:
-        await ctx.send("A raffle is already running!")
+    if not rows:
+        await ctx.send("No audit entries found.")
         return
 
-    if prize <= 0:
-        await ctx.send("The prize must be more than 0 coins.")
+    lines = ["🛡️ **Recent coin activity**"]
+
+    for user_id, amount, action, details, created_at in rows:
+        lines.append(
+            f"User `{user_id}` | {amount:+,} | `{action}` "
+            f"| {details[:60]} | {created_at}"
+        )
+
+    # Discord messages have a character limit.
+    await ctx.send("\n".join(lines)[:1900])
+
+
+# ============================================================
+# RAFFLE COMMAND
+# ============================================================
+
+async def finish_raffle(raffle_id):
+    global active_raffle, raffle_task
+
+    row = db.execute(
+        """
+        SELECT guild_id, channel_id, prize, end_time
+        FROM active_raffles
+        WHERE raffle_id = ? AND status = 'active'
+        """,
+        (raffle_id,)
+    ).fetchone()
+
+    if not row:
         return
 
-    raffle_id = uuid.uuid4().hex
+    guild_id, channel_id, prize, end_time = row
+    await asyncio.sleep(max(0, end_time - time.time()))
 
-    active_raffle = {
-        "id": raffle_id,
-        "prize": prize,
-        "entrants": set(),
-        "channel": ctx.channel,
-    }
+    row = db.execute(
+        """
+        SELECT guild_id, channel_id, prize
+        FROM active_raffles
+        WHERE raffle_id = ? AND status = 'active'
+        """,
+        (raffle_id,)
+    ).fetchone()
 
-    await ctx.send(
-        f"🎟️ **RAFFLE STARTED!**\n"
-        f"Prize pool: 🪙 {prize:,} coins\n"
-        f"Two random bonus winners will each receive 30% "
-        f"of the prize pool.\n"
-        f"The remaining coins will be shared equally among "
-        f"all other entrants.\n"
-        f"Type `!join` within {RAFFLE_SECONDS} seconds "
-        f"to enter for free!"
-    )
-
-    await asyncio.sleep(RAFFLE_SECONDS)
-
-    raffle_data = active_raffle
-
-    if raffle_data is None or raffle_data["id"] != raffle_id:
+    if not row:
         return
 
-    entrants = list(raffle_data["entrants"])
+    entrants = [
+        entry[0]
+        for entry in db.execute(
+            "SELECT user_id FROM raffle_entries WHERE raffle_id = ?",
+            (raffle_id,)
+        ).fetchall()
+    ]
+
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            print(f"RAFFLE CHANNEL UNAVAILABLE: {channel_id}")
+            return
 
     if not entrants:
+        with db:
+            db.execute(
+                """
+                UPDATE active_raffles SET status = 'no_entries'
+                WHERE raffle_id = ?
+                """,
+                (raffle_id,)
+            )
+
         active_raffle = None
-        await ctx.channel.send(
+        await channel.send(
             "🎟️ Raffle ended with no entrants. No coins awarded."
         )
         return
@@ -418,7 +1191,6 @@ async def raffle(ctx, prize: int):
     payouts = {}
 
     if len(entrants) < 3:
-        # With one or two entrants, split the entire prize.
         each = prize // len(entrants)
         remainder = prize % len(entrants)
 
@@ -427,7 +1199,7 @@ async def raffle(ctx, prize: int):
 
     else:
         bonus_winners = random.sample(entrants, 2)
-        other_entrants = [
+        others = [
             user_id for user_id in entrants
             if user_id not in bonus_winners
         ]
@@ -438,16 +1210,11 @@ async def raffle(ctx, prize: int):
             payouts[user_id] = bonus_each
 
         remaining_pool = prize - (bonus_each * 2)
-        each_share = remaining_pool // len(other_entrants)
-        remainder = remaining_pool % len(other_entrants)
+        each = remaining_pool // len(others)
+        remainder = remaining_pool % len(others)
 
-        for index, user_id in enumerate(other_entrants):
-            payouts[user_id] = each_share + (
-                1 if index < remainder else 0
-            )
-
-    # Close the raffle before applying the payout.
-    active_raffle = None
+        for index, user_id in enumerate(others):
+            payouts[user_id] = each + (1 if index < remainder else 0)
 
     try:
         pay_raffle_atomically(raffle_id, prize, payouts)
@@ -459,29 +1226,82 @@ async def raffle(ctx, prize: int):
             f"| payouts={payouts} | error={error!r}"
         )
 
-        await ctx.channel.send(
-            "⚠️ The raffle payout could not be verified. "
-            "Please check the FadeHost console before running "
-            "another raffle. No success announcement was made."
+        await channel.send(
+            "⚠️ Raffle payout could not be confirmed. "
+            "Please check the FadeHost console before running another raffle."
         )
         return
+
+    active_raffle = None
+    raffle_task = None
 
     lines = ["🎉 **RAFFLE PAYOUTS SAVED SUCCESSFULLY!**"]
 
     for user_id, amount in payouts.items():
-        member = ctx.guild.get_member(user_id)
-        name = member.mention if member else f"<@{user_id}>"
-        lines.append(f"{name} received 🪙 **{amount:,} coins**")
+        lines.append(f"<@{user_id}> received 🪙 **{amount:,} coins**")
 
-    lines.append(
-        f"\nTotal distributed: 🪙 **{sum(payouts.values()):,}**"
-    )
+    lines.append(f"\nTotal distributed: 🪙 **{sum(payouts.values()):,}**")
     lines.append(f"Raffle reference: `{raffle_id}`")
 
-    await ctx.channel.send("\n".join(lines))
+    await channel.send("\n".join(lines))
 
 
-# ---------------- JOIN RAFFLE ----------------
+@bot.command()
+@commands.has_role(MODERATOR_ROLE)
+async def raffle(ctx, prize: int):
+    global active_raffle, raffle_task
+
+    if active_raffle is not None:
+        await ctx.send("A raffle is already running!")
+        return
+
+    if prize <= 0:
+        await ctx.send("The prize must be more than 0 coins.")
+        return
+
+    raffle_id = uuid.uuid4().hex
+    end_time = time.time() + RAFFLE_SECONDS
+
+    try:
+        with db:
+            db.execute(
+                """
+                INSERT INTO active_raffles
+                (raffle_id, guild_id, channel_id, prize, end_time, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    raffle_id,
+                    ctx.guild.id,
+                    ctx.channel.id,
+                    prize,
+                    end_time
+                )
+            )
+    except sqlite3.Error as error:
+        print(f"RAFFLE START ERROR: {error!r}")
+        await ctx.send("Couldn't save the raffle. Please try again.")
+        return
+
+    active_raffle = {
+        "id": raffle_id,
+        "guild_id": ctx.guild.id,
+        "channel_id": ctx.channel.id,
+        "prize": prize,
+        "end_time": end_time,
+    }
+
+    await ctx.send(
+        f"🎟️ **RAFFLE STARTED!**\n"
+        f"Prize pool: 🪙 {prize:,} coins\n"
+        f"Two random bonus winners will each receive 30% of the prize.\n"
+        f"The remaining 40% will be shared among all other entrants.\n"
+        f"With fewer than 3 entrants, the full prize is shared equally.\n"
+        f"Type `!join` within {RAFFLE_SECONDS} seconds to enter for free!"
+    )
+
+    raffle_task = asyncio.create_task(finish_raffle(raffle_id))
+
 
 @bot.command()
 async def join(ctx):
@@ -489,23 +1309,35 @@ async def join(ctx):
         await ctx.send("There isn't a raffle running right now.")
         return
 
-    if active_raffle["channel"].id != ctx.channel.id:
+    if active_raffle["channel_id"] != ctx.channel.id:
         await ctx.send("This raffle is running in a different channel.")
         return
 
-    user_id = ctx.author.id
-
-    if user_id in active_raffle["entrants"]:
+    try:
+        with db:
+            db.execute(
+                """
+                INSERT INTO raffle_entries (raffle_id, user_id)
+                VALUES (?, ?)
+                """,
+                (active_raffle["id"], ctx.author.id)
+            )
+    except sqlite3.IntegrityError:
         await ctx.send("You're already entered in this raffle!")
         return
+    except sqlite3.Error as error:
+        print(f"RAFFLE JOIN ERROR: {error!r}")
+        await ctx.send("Couldn't save your entry. Please try again.")
+        return
 
-    active_raffle["entrants"].add(user_id)
     await ctx.send(
         f"🎟️ {ctx.author.mention} entered the raffle for free!"
     )
 
 
-# ---------------- RUN BOT ----------------
+# ============================================================
+# RUN
+# ============================================================
 
 if not TOKEN:
     raise RuntimeError(
