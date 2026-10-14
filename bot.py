@@ -21,7 +21,7 @@ MODERATOR_ROLE = "Stream Mod"
 RAFFLE_SECONDS = 60
 COINS_CHANNEL_ID = 1559575575239069737
 
-# Use the existing database. Do not delete or reset it.
+# Keep the existing database. Do not delete or reset it.
 db = sqlite3.connect("streamcoins.db", timeout=30)
 db.execute("PRAGMA busy_timeout = 30000")
 
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS balances (
 )
 """)
 
-# This table records each successful raffle payout.
+# Records completed raffle payouts to prevent duplicate payout IDs.
 db.execute("""
 CREATE TABLE IF NOT EXISTS raffle_payouts (
     raffle_id TEXT PRIMARY KEY,
@@ -75,7 +75,6 @@ def balance(user_id):
 
 def add_coins(user_id, amount):
     balance(user_id)
-
     db.execute(
         "UPDATE balances SET coins = coins + ? WHERE user_id = ?",
         (amount, user_id)
@@ -86,16 +85,12 @@ def add_coins(user_id, amount):
 # ---------------- SAFE RAFFLE PAYOUT ----------------
 
 def pay_raffle_atomically(raffle_id, prize, payouts):
-    """
-    All raffle payouts and the completion record are saved together.
-    If an error happens before commit, the changes are rolled back.
-    A raffle ID cannot be paid twice.
-    """
+    """Apply every payout in one database transaction."""
 
-    if sum(payouts.values()) != prize:
+    total = sum(payouts.values())
+    if total != prize:
         raise ValueError(
-            f"Payout total {sum(payouts.values())} "
-            f"does not equal prize {prize}"
+            f"Payout total {total} does not equal prize {prize}"
         )
 
     payout_json = json.dumps({
@@ -106,7 +101,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
     db.execute("BEGIN IMMEDIATE")
 
     try:
-        # The unique raffle ID prevents accidental duplicate payouts.
+        # The unique raffle ID prevents this raffle being paid twice.
         db.execute(
             """
             INSERT INTO raffle_payouts (raffle_id, prize, payouts)
@@ -116,7 +111,6 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
         )
 
         for user_id, amount in payouts.items():
-            # Preserve existing balances; create only missing accounts.
             db.execute(
                 """
                 INSERT OR IGNORE INTO balances (user_id, coins)
@@ -161,7 +155,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
         db.rollback()
         raise
 
-    # Check the saved balances again after the transaction commits.
+    # Read balances again after commit for console verification.
     for user_id, amount in payouts.items():
         saved = db.execute(
             "SELECT coins FROM balances WHERE user_id = ?",
@@ -181,7 +175,7 @@ def pay_raffle_atomically(raffle_id, prize, payouts):
 
     print(
         f"RAFFLE COMPLETE | raffle={raffle_id} "
-        f"| total_paid={sum(payouts.values())}"
+        f"| total_paid={total}"
     )
 
 
@@ -226,11 +220,11 @@ async def on_message(message):
 @bot.event
 async def on_ready():
     print(f"StreamCoins online as {bot.user}")
-    print(f"Raffle payouts use database: {os.path.abspath('streamcoins.db')}")
+    print(f"Database: {os.path.abspath('streamcoins.db')}")
     print(f"Commands channel ID: {COINS_CHANNEL_ID}")
 
 
-# ---------------- BALANCE COMMAND ----------------
+# ---------------- BALANCE ----------------
 
 @bot.command(name="balance")
 async def show_balance(ctx):
@@ -246,7 +240,7 @@ async def show_balance(ctx):
         )
 
 
-# ---------------- GAMBLE COMMAND ----------------
+# ---------------- GAMBLE ----------------
 
 @bot.command()
 async def gamble(ctx, amount: int):
@@ -298,8 +292,42 @@ async def leaderboard(ctx):
 
         for rank, (user_id, coins) in enumerate(rows, start=1):
             member = ctx.guild.get_member(user_id)
-            name = member.display_name if member else f"User {user_id}"
-            lines.append(f"**{rank}.** {name} — 🪙 {coins:,}")
+
+            # First try to fetch their current server membership.
+            if member is None:
+                try:
+                    member = await ctx.guild.fetch_member(user_id)
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException
+                ):
+                    member = None
+
+            # If they are not in the server, try their global username.
+            if member is not None:
+                name = member.display_name
+            else:
+                try:
+                    user = await bot.fetch_user(user_id)
+                    name = user.name
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException
+                ):
+                    name = f"Unknown player ({user_id})"
+
+            medal = {
+                1: "🥇",
+                2: "🥈",
+                3: "🥉"
+            }.get(rank, f"**{rank}.**")
+
+            lines.append(
+                f"{medal} **{discord.utils.escape_markdown(name)}** "
+                f"— 🪙 {coins:,} coins"
+            )
 
         text = "\n".join(lines) if lines else "No scores yet."
         await ctx.send(f"🏆 **StreamCoins Leaderboard**\n{text}")
@@ -365,7 +393,7 @@ async def raffle(ctx, prize: int):
         f"Prize pool: 🪙 {prize:,} coins\n"
         f"Two random bonus winners will each receive 30% "
         f"of the prize pool.\n"
-        f"The remaining 40% will be shared equally among "
+        f"The remaining coins will be shared equally among "
         f"all other entrants.\n"
         f"Type `!join` within {RAFFLE_SECONDS} seconds "
         f"to enter for free!"
@@ -387,12 +415,10 @@ async def raffle(ctx, prize: int):
         )
         return
 
-    # Calculate every payout before changing any balance.
     payouts = {}
-    bonus_winners = []
 
     if len(entrants) < 3:
-        # With fewer than three entrants, split the full prize.
+        # With one or two entrants, split the entire prize.
         each = prize // len(entrants)
         remainder = prize % len(entrants)
 
@@ -420,7 +446,7 @@ async def raffle(ctx, prize: int):
                 1 if index < remainder else 0
             )
 
-    # Stop new entries while the payout is processed.
+    # Close the raffle before applying the payout.
     active_raffle = None
 
     try:
@@ -435,13 +461,11 @@ async def raffle(ctx, prize: int):
 
         await ctx.channel.send(
             "⚠️ The raffle payout could not be verified. "
-            "No success announcement has been made. "
-            "Please contact a bot administrator and check "
-            "the FadeHost console before running another raffle."
+            "Please check the FadeHost console before running "
+            "another raffle. No success announcement was made."
         )
         return
 
-    # Announce success only after all balance updates commit.
     lines = ["🎉 **RAFFLE PAYOUTS SAVED SUCCESSFULLY!**"]
 
     for user_id, amount in payouts.items():
@@ -449,7 +473,9 @@ async def raffle(ctx, prize: int):
         name = member.mention if member else f"<@{user_id}>"
         lines.append(f"{name} received 🪙 **{amount:,} coins**")
 
-    lines.append(f"\nTotal distributed: 🪙 **{sum(payouts.values()):,}**")
+    lines.append(
+        f"\nTotal distributed: 🪙 **{sum(payouts.values()):,}**"
+    )
     lines.append(f"Raffle reference: `{raffle_id}`")
 
     await ctx.channel.send("\n".join(lines))
@@ -474,10 +500,12 @@ async def join(ctx):
         return
 
     active_raffle["entrants"].add(user_id)
-    await ctx.send(f"🎟️ {ctx.author.mention} entered the raffle for free!")
+    await ctx.send(
+        f"🎟️ {ctx.author.mention} entered the raffle for free!"
+    )
 
 
-# ---------------- START BOT ----------------
+# ---------------- RUN BOT ----------------
 
 if not TOKEN:
     raise RuntimeError(
