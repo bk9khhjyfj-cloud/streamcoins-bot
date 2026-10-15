@@ -20,6 +20,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 COINS_CHANNEL_ID = 1559575575239069737
 MODERATOR_ROLE = "Stream Mod"
+ADMIN_ROLE = "Admin"
 
 STARTING_COINS = 100
 CHAT_REWARD = 5
@@ -444,10 +445,10 @@ async def on_message(message):
 # BALANCE
 # ============================================================
 
-@bot.command(name="balance")
-async def show_balance(ctx):
+@bot.command()
+async def balance(ctx):
     try:
-        coins = balance(ctx.author.id)
+        coins = globals()["balance"](ctx.author.id)
         await ctx.send(
             f"🪙 {ctx.author.display_name}: **{coins:,} coins**"
         )
@@ -790,10 +791,6 @@ async def get_player_name(guild, user_id):
 async def resolve_audit_details(guild, details):
     """
     Convert older audit details containing Discord IDs into names.
-    Examples:
-      From 304751934240325643 -> From StreamMod
-      To 304751934240325643 -> To MADPOPROC2016
-      Granted by 304751934240325643 -> Granted by StreamMod
     """
     if not details:
         return details
@@ -804,7 +801,6 @@ async def resolve_audit_details(guild, details):
         if details.startswith(prefix):
             possible_id = details[len(prefix):].strip()
 
-            # Only attempt a lookup when the entire value is a numeric ID.
             if possible_id.isdigit():
                 name = await get_player_name(guild, int(possible_id))
                 return f"{prefix}{name}"
@@ -1006,7 +1002,6 @@ async def pay(ctx, member: discord.Member, amount: int):
         await ctx.send("Enter a positive amount, e.g. `!pay @member 500`.")
         return
 
-    # Save names in new audit entries instead of numeric user IDs.
     sender_name = ctx.author.display_name
     receiver_name = member.display_name
 
@@ -1047,7 +1042,6 @@ async def pay(ctx, member: discord.Member, amount: int):
             (amount, receiver_id)
         )
 
-        # New records now contain names, not numeric IDs.
         log_audit(
             sender_id,
             -amount,
@@ -1087,7 +1081,6 @@ async def givecoins(ctx, member: discord.Member, amount: int):
         return
 
     try:
-        # Save the moderator's display name in the audit details.
         moderator_name = ctx.author.display_name
 
         add_coins(
@@ -1112,6 +1105,132 @@ async def givecoins_error(ctx, error):
         await ctx.send("You need Manage Server permission.")
     else:
         await ctx.send("Usage: `!givecoins @member 500`")
+
+
+# ============================================================
+# GIVE COINS TO EVERY HUMAN MEMBER — ADMIN ROLE ONLY
+# ============================================================
+
+@bot.command(name="giveall")
+@commands.has_role(ADMIN_ROLE)
+async def giveall(ctx, amount: int):
+    if amount <= 0:
+        await ctx.send("The amount must be a positive number.")
+        return
+
+    if ctx.guild is None:
+        await ctx.send("This command must be used inside your server.")
+        return
+
+    try:
+        # Fetch current server members and exclude bots.
+        members = [
+            member
+            async for member in ctx.guild.fetch_members(limit=None)
+            if not member.bot
+        ]
+
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"GIVEALL MEMBER FETCH ERROR: {error!r}")
+        await ctx.send(
+            "Couldn't retrieve the server members. "
+            "Please check the bot's permissions and try again."
+        )
+        return
+
+    if not members:
+        await ctx.send("There are no eligible human members to pay.")
+        return
+
+    moderator_name = ctx.author.display_name
+    db.execute("BEGIN IMMEDIATE")
+
+    try:
+        # All grants and audit records are committed together.
+        # If any database operation fails, the transaction rolls back.
+        for member in members:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO balances (user_id, coins)
+                VALUES (?, ?)
+                """,
+                (member.id, STARTING_COINS)
+            )
+
+            before = db.execute(
+                "SELECT coins FROM balances WHERE user_id = ?",
+                (member.id,)
+            ).fetchone()[0]
+
+            db.execute(
+                """
+                UPDATE balances
+                SET coins = coins + ?
+                WHERE user_id = ?
+                """,
+                (amount, member.id)
+            )
+
+            after = db.execute(
+                "SELECT coins FROM balances WHERE user_id = ?",
+                (member.id,)
+            ).fetchone()[0]
+
+            if after != before + amount:
+                raise RuntimeError(
+                    f"Balance verification failed for {member.id}"
+                )
+
+            log_audit(
+                member.id,
+                amount,
+                "admin_grant_all",
+                f"Granted by {moderator_name}"
+            )
+
+            record_weekly_earning(member.id, amount)
+
+        db.commit()
+
+    except Exception as error:
+        db.rollback()
+        print(f"GIVEALL PAYOUT ERROR: {error!r}")
+        await ctx.send(
+            "⚠️ The mass grant failed and was rolled back. "
+            "Please check the FadeHost console."
+        )
+        return
+
+    total = amount * len(members)
+
+    print(
+        f"GIVEALL COMPLETE | guild={ctx.guild.id} "
+        f"| moderator={ctx.author.id} "
+        f"| members={len(members)} "
+        f"| each={amount} | total={total}"
+    )
+
+    await ctx.send(
+        f"✅ **Coins distributed successfully!**\n"
+        f"👥 Members paid: **{len(members):,}**\n"
+        f"🪙 Each received: **{amount:,} coins**\n"
+        f"💰 Total distributed: **{total:,} coins**"
+    )
+
+
+@giveall.error
+async def giveall_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send(
+            f"⛔ You need the **{ADMIN_ROLE}** role to use `!giveall`."
+        )
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Usage: `!giveall 500`")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("Please enter a whole number, e.g. `!giveall 500`.")
+    else:
+        print(f"GIVEALL COMMAND ERROR: {error!r}")
+        await ctx.send("Couldn't complete the mass grant. Please try again.")
 
 
 # ============================================================
@@ -1149,16 +1268,10 @@ async def audit(ctx, member: discord.Member = None):
     lines = ["🛡️ **Recent coin activity**"]
 
     for user_id, amount, action, details, created_at in rows:
-        # Resolve the player whose balance was affected.
         name = await get_player_name(ctx.guild, user_id)
         name = discord.utils.escape_markdown(name)
 
-        # Convert old "From <ID>", "To <ID>", and
-        # "Granted by <ID>" audit details into names.
         details = await resolve_audit_details(ctx.guild, details)
-
-        # Escape names/details so Markdown characters in display names
-        # cannot accidentally break the audit formatting.
         details = discord.utils.escape_markdown(details[:100])
         safe_action = discord.utils.escape_markdown(action)
 
@@ -1167,7 +1280,6 @@ async def audit(ctx, member: discord.Member = None):
             f"| {details} | {created_at}"
         )
 
-    # Keep the message within Discord's message-length limit.
     output = "\n".join(lines)
 
     if len(output) > 1900:
