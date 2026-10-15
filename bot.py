@@ -1,4 +1,3 @@
-
 import os
 import json
 import math
@@ -443,7 +442,7 @@ async def on_message(message):
 
 
 # ============================================================
-# BALANCE — FIXED
+# BALANCE
 # ============================================================
 
 @bot.command(name="balance")
@@ -494,7 +493,7 @@ async def gamble(ctx, amount: int):
 
 
 # ============================================================
-# JACKPOT SLOTS
+# JACKPOT SLOTS — UPDATED ODDS
 # ============================================================
 
 @bot.command()
@@ -502,7 +501,9 @@ async def slots(ctx, amount: int):
     user_id = ctx.author.id
 
     if amount <= 0:
-        await ctx.send("Enter a positive stake, e.g. `!slots 500`.")
+        await ctx.send(
+            "Enter a positive stake, e.g. `!slots 500`."
+        )
         return
 
     try:
@@ -512,49 +513,80 @@ async def slots(ctx, amount: int):
             await ctx.send(f"You only have {coins:,} coins.")
             return
 
+        # Everyone has the same odds on every spin.
+        # 60% chance of a payout and 40% chance of a loss.
         outcome = random.choices(
-            ["jackpot", "triple", "pair", "miss"],
-            weights=[1, 5, 24, 70],
+            ["miss", "small", "triple", "jackpot", "mega"],
+            weights=[40, 35, 20, 4, 1],
             k=1
         )[0]
 
-        if outcome == "jackpot":
+        if outcome == "mega":
             payout = amount * 10
-            symbols = "💎 💎 💎"
-        elif outcome == "triple":
+            symbols = "💎 💎 💎 💎"
+            description = "💎 MEGA JACKPOT!"
+
+        elif outcome == "jackpot":
             payout = amount * 5
             symbols = "7️⃣ 7️⃣ 7️⃣"
-        elif outcome == "pair":
+            description = "🎉 JACKPOT!"
+
+        elif outcome == "triple":
             payout = (amount * 3) // 2
-            symbols = "🍒 🍒 🍋"
+            symbols = "🍒 🍒 🍒"
+            description = "🔥 Three of a kind!"
+
+        elif outcome == "small":
+            payout = (amount * 11) // 10
+            symbols = "🍋 🍋 🍊"
+            description = "✨ Small win!"
+
         else:
             payout = 0
             symbols = "🍋 🍊 🍒"
+            description = "Unlucky! Try again."
 
+        # Payout includes the stake returned to the player.
+        # Net is the actual change to their balance.
         net = payout - amount
 
         add_coins(
             user_id,
             net,
             "slots",
-            f"Symbols {symbols}; stake {amount}; payout {payout}"
+            (
+                f"Outcome {outcome}; symbols {symbols}; "
+                f"stake {amount}; payout {payout}"
+            )
         )
 
-        if payout > amount:
-            result = f"You won **{payout:,} coins**!"
-        elif payout == amount:
-            result = "You got your stake back!"
-        else:
+        if outcome == "miss":
             result = f"You lost **{amount:,} coins**."
 
+        elif net == 0:
+            result = "You got your stake back!"
+
+        elif net > 0:
+            result = (
+                f"You made **{net:,} coins profit**! "
+                f"(Total payout: {payout:,} coins.)"
+            )
+
+        else:
+            result = f"You lost **{-net:,} coins**."
+
         await ctx.send(
-            f"🎰 **{symbols}**\n{ctx.author.mention}, {result}\n"
+            f"🎰 **{symbols}**\n"
+            f"{description}\n"
+            f"{ctx.author.mention}, {result}\n"
             f"Balance: 🪙 {balance(user_id):,}"
         )
 
     except sqlite3.Error as error:
         print(f"SLOTS ERROR: {error!r}")
-        await ctx.send("Couldn't save the slot result. Please try again.")
+        await ctx.send(
+            "Couldn't save the slot result. Please try again."
+        )
 
 
 # ============================================================
