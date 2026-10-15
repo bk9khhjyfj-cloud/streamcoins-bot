@@ -52,8 +52,7 @@ SHOP_ITEMS = {
 # DATABASE
 # ============================================================
 
-# Keep using the existing database to preserve all balances
-# and audit history. Do not delete streamcoins.db.
+# Keep the existing database. Never delete streamcoins.db.
 db = sqlite3.connect("streamcoins.db", timeout=30)
 db.execute("PRAGMA busy_timeout = 30000")
 db.execute("PRAGMA foreign_keys = ON")
@@ -177,6 +176,8 @@ def record_weekly_earning(user_id, amount):
     )
 
 
+# IMPORTANT: This is the database balance helper.
+# Do not name a Discord command function "balance".
 def balance(user_id):
     row = db.execute(
         "SELECT coins FROM balances WHERE user_id = ?",
@@ -442,13 +443,13 @@ async def on_message(message):
 
 
 # ============================================================
-# BALANCE
+# BALANCE — FIXED
 # ============================================================
 
-@bot.command()
-async def balance(ctx):
+@bot.command(name="balance")
+async def show_balance(ctx):
     try:
-        coins = globals()["balance"](ctx.author.id)
+        coins = balance(ctx.author.id)
         await ctx.send(
             f"🪙 {ctx.author.display_name}: **{coins:,} coins**"
         )
@@ -789,9 +790,7 @@ async def get_player_name(guild, user_id):
 
 
 async def resolve_audit_details(guild, details):
-    """
-    Convert older audit details containing Discord IDs into names.
-    """
+    """Convert older audit details containing Discord IDs into names."""
     if not details:
         return details
 
@@ -1123,7 +1122,7 @@ async def giveall(ctx, amount: int):
         return
 
     try:
-        # Fetch current server members and exclude bots.
+        # Fetch all current server members and exclude bots.
         members = [
             member
             async for member in ctx.guild.fetch_members(limit=None)
@@ -1143,11 +1142,11 @@ async def giveall(ctx, amount: int):
         return
 
     moderator_name = ctx.author.display_name
-    db.execute("BEGIN IMMEDIATE")
 
     try:
-        # All grants and audit records are committed together.
-        # If any database operation fails, the transaction rolls back.
+        db.execute("BEGIN IMMEDIATE")
+
+        # Commit every grant together, or roll back the entire batch.
         for member in members:
             db.execute(
                 """
@@ -1193,7 +1192,9 @@ async def giveall(ctx, amount: int):
         db.commit()
 
     except Exception as error:
-        db.rollback()
+        if db.in_transaction:
+            db.rollback()
+
         print(f"GIVEALL PAYOUT ERROR: {error!r}")
         await ctx.send(
             "⚠️ The mass grant failed and was rolled back. "
